@@ -1,3 +1,47 @@
+package app.shashi.AdminTalk.utils;
+
+public class AppStateTracker {
+    private static boolean isInChat = false;
+    private static String currentChatId = null;
+    private static boolean isAppInForeground = false;
+
+    public static void setInChat(boolean inChat, String chatId) {
+        isInChat = inChat;
+        currentChatId = chatId;
+    }
+
+    public static void setAppInForeground(boolean inForeground) {
+        isAppInForeground = inForeground;
+    }
+
+    public static boolean shouldShowNotification(String messageChatId) {
+        if (!isAppInForeground) {
+            return true;
+        }
+        
+        if (!isInChat) {
+            return true;
+        }
+
+        // Don't show notification if user is in the same chat where message came from
+        return currentChatId == null || !currentChatId.equals(messageChatId);
+    }
+
+    public static void reset() {
+        isInChat = false;
+        currentChatId = null;
+        isAppInForeground = false;
+    }
+}
+
+
+
+
+
+
+
+
+
 package app.shashi.AdminTalk.services;
 
 import android.app.Notification;
@@ -8,10 +52,7 @@ import androidx.annotation.Nullable;
 import androidx.core.app.NotificationCompat;
 import app.shashi.AdminTalk.R;
 import app.shashi.AdminTalk.models.Message;
-import app.shashi.AdminTalk.utils.Constants;
-import app.shashi.AdminTalk.utils.FirebaseHelper;
-import app.shashi.AdminTalk.utils.NotificationHelper;
-import app.shashi.AdminTalk.utils.AuthHelper;
+import app.shashi.AdminTalk.utils.*;
 import com.google.firebase.database.*;
 
 public class MessageNotificationService extends Service {
@@ -19,7 +60,7 @@ public class MessageNotificationService extends Service {
     private ChildEventListener messagesListener;
     private String currentUserId;
     private static final int FOREGROUND_SERVICE_ID = 1001;
-    private static final String ADMIN_DISPLAY_NAME = "Admin"; // Fixed admin name
+    private static final String ADMIN_DISPLAY_NAME = "Admin";
     private boolean isServiceInitialized = false;
 
     @Override
@@ -52,47 +93,25 @@ public class MessageNotificationService extends Service {
         }
     }
 
-    private Notification createForegroundNotification() {
-        return new NotificationCompat.Builder(this, NotificationHelper.CHANNEL_ID)
-                .setSmallIcon(R.drawable.ic_notification)
-                .setContentTitle("Chat Service")
-                .setContentText("Listening for new messages")
-                .setPriority(NotificationCompat.PRIORITY_MIN)
-                .setNotificationSilent()
-                .build();
-    }
+    private void showNotification(Message message, String chatId) {
+        // Only proceed if we should show the notification
+        if (!AppStateTracker.shouldShowNotification(chatId)) {
+            return;
+        }
 
-    @Override
-    public int onStartCommand(Intent intent, int flags, int startId) {
-        return START_STICKY;
-    }
+        AuthHelper.isAdmin().addOnCompleteListener(task -> {
+            if (task.isSuccessful()) {
+                boolean isUserAdmin = task.getResult();
+                String title = !isUserAdmin ? ADMIN_DISPLAY_NAME : message.getSenderName();
 
-    private void listenToAllChats() {
-        databaseRef.addChildEventListener(new ChildEventListener() {
-            @Override
-            public void onChildAdded(DataSnapshot chatSnapshot, String previousChildName) {
-                String userId = chatSnapshot.getKey();
-                if (userId != null && !userId.equals(currentUserId)) {
-                    DatabaseReference messagesRef = chatSnapshot.getRef()
-                            .child(Constants.MESSAGES_REF);
-                    listenToMessages(messagesRef, userId);
-                }
+                NotificationHelper.showMessageNotification(
+                    this,
+                    title,
+                    message.getText(),
+                    message.getSenderId(),
+                    message.getSenderName()
+                );
             }
-
-            @Override
-            public void onChildChanged(DataSnapshot snapshot, String previousChildName) {}
-            @Override
-            public void onChildRemoved(DataSnapshot snapshot) {
-                if (snapshot.getKey() != null) {
-                    DatabaseReference messagesRef = snapshot.getRef()
-                            .child(Constants.MESSAGES_REF);
-                    messagesRef.removeEventListener(messagesListener);
-                }
-            }
-            @Override
-            public void onChildMoved(DataSnapshot snapshot, String previousChildName) {}
-            @Override
-            public void onCancelled(DatabaseError error) {}
         });
     }
 
@@ -102,7 +121,7 @@ public class MessageNotificationService extends Service {
             public void onChildAdded(DataSnapshot snapshot, String previousChildName) {
                 Message message = snapshot.getValue(Message.class);
                 if (message != null && !message.getSenderId().equals(currentUserId)) {
-                    showNotification(message);
+                    showNotification(message, currentUserId);
                 }
             }
 
@@ -124,7 +143,7 @@ public class MessageNotificationService extends Service {
             public void onChildAdded(DataSnapshot snapshot, String previousChildName) {
                 Message message = snapshot.getValue(Message.class);
                 if (message != null && !message.getSenderId().equals(currentUserId)) {
-                    showNotification(message);
+                    showNotification(message, userId);
                 }
             }
 
@@ -140,35 +159,7 @@ public class MessageNotificationService extends Service {
         messagesRef.addChildEventListener(chatMessagesListener);
     }
 
-    private void showNotification(Message message) {
-        AuthHelper.isAdmin().addOnCompleteListener(task -> {
-            if (task.isSuccessful()) {
-                boolean isUserAdmin = task.getResult();
-                String title;
-                if (!isUserAdmin) {
-                    // If the current user is not an admin, always show fixed admin name
-                    title = ADMIN_DISPLAY_NAME;
-                } else {
-                    // If current user is admin, show the actual sender name
-                    title = message.getSenderName();
-                }
-
-                NotificationHelper.showMessageNotification(
-                    this,
-                    title,
-                    message.getText(),
-                    message.getSenderId(),
-                    message.getSenderName()
-                );
-            }
-        });
-    }
-
-    @Nullable
-    @Override
-    public IBinder onBind(Intent intent) {
-        return null;
-    }
+    // ... (other existing methods remain the same)
 
     @Override
     public void onDestroy() {
@@ -176,6 +167,33 @@ public class MessageNotificationService extends Service {
         if (messagesListener != null && databaseRef != null) {
             databaseRef.removeEventListener(messagesListener);
         }
+        AppStateTracker.reset();
         AuthHelper.clearCache();
     }
 }
+
+
+
+
+
+
+
+
+@Override
+protected void onResume() {
+    super.onResume();
+    AppStateTracker.setInChat(true, userId); // userId is the chat partner's ID
+    AppStateTracker.setAppInForeground(true);
+}
+
+@Override
+protected void onPause() {
+    super.onPause();
+    AppStateTracker.setInChat(false, null);
+}
+
+
+
+
+
+
