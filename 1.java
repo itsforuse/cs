@@ -1,47 +1,3 @@
-package app.shashi.AdminTalk.utils;
-
-public class AppStateTracker {
-    private static boolean isInChat = false;
-    private static String currentChatId = null;
-    private static boolean isAppInForeground = false;
-
-    public static void setInChat(boolean inChat, String chatId) {
-        isInChat = inChat;
-        currentChatId = chatId;
-    }
-
-    public static void setAppInForeground(boolean inForeground) {
-        isAppInForeground = inForeground;
-    }
-
-    public static boolean shouldShowNotification(String messageChatId) {
-        if (!isAppInForeground) {
-            return true;
-        }
-        
-        if (!isInChat) {
-            return true;
-        }
-
-        // Don't show notification if user is in the same chat where message came from
-        return currentChatId == null || !currentChatId.equals(messageChatId);
-    }
-
-    public static void reset() {
-        isInChat = false;
-        currentChatId = null;
-        isAppInForeground = false;
-    }
-}
-
-
-
-
-
-
-
-
-
 package app.shashi.AdminTalk.services;
 
 import android.app.Notification;
@@ -52,7 +8,10 @@ import androidx.annotation.Nullable;
 import androidx.core.app.NotificationCompat;
 import app.shashi.AdminTalk.R;
 import app.shashi.AdminTalk.models.Message;
-import app.shashi.AdminTalk.utils.*;
+import app.shashi.AdminTalk.utils.Constants;
+import app.shashi.AdminTalk.utils.FirebaseHelper;
+import app.shashi.AdminTalk.utils.NotificationHelper;
+import app.shashi.AdminTalk.utils.AuthHelper;
 import com.google.firebase.database.*;
 
 public class MessageNotificationService extends Service {
@@ -62,6 +21,10 @@ public class MessageNotificationService extends Service {
     private static final int FOREGROUND_SERVICE_ID = 1001;
     private static final String ADMIN_DISPLAY_NAME = "Admin";
     private boolean isServiceInitialized = false;
+    
+    // Track active chat and app state
+    private static String activeChatId = null;
+    private static boolean isAppInForeground = false;
 
     @Override
     public void onCreate() {
@@ -75,6 +38,15 @@ public class MessageNotificationService extends Service {
                 initializeService(isAdmin);
             }
         });
+    }
+
+    // Add static methods to update chat and app state
+    public static void setActiveChatId(String chatId) {
+        activeChatId = chatId;
+    }
+
+    public static void setAppInForeground(boolean inForeground) {
+        isAppInForeground = inForeground;
     }
 
     private void initializeService(boolean isAdmin) {
@@ -93,25 +65,47 @@ public class MessageNotificationService extends Service {
         }
     }
 
-    private void showNotification(Message message, String chatId) {
-        // Only proceed if we should show the notification
-        if (!AppStateTracker.shouldShowNotification(chatId)) {
-            return;
-        }
+    private Notification createForegroundNotification() {
+        return new NotificationCompat.Builder(this, NotificationHelper.CHANNEL_ID)
+                .setSmallIcon(R.drawable.ic_notification)
+                .setContentTitle("Chat Service")
+                .setContentText("Listening for new messages")
+                .setPriority(NotificationCompat.PRIORITY_MIN)
+                .setNotificationSilent()
+                .build();
+    }
 
-        AuthHelper.isAdmin().addOnCompleteListener(task -> {
-            if (task.isSuccessful()) {
-                boolean isUserAdmin = task.getResult();
-                String title = !isUserAdmin ? ADMIN_DISPLAY_NAME : message.getSenderName();
+    @Override
+    public int onStartCommand(Intent intent, int flags, int startId) {
+        return START_STICKY;
+    }
 
-                NotificationHelper.showMessageNotification(
-                    this,
-                    title,
-                    message.getText(),
-                    message.getSenderId(),
-                    message.getSenderName()
-                );
+    private void listenToAllChats() {
+        databaseRef.addChildEventListener(new ChildEventListener() {
+            @Override
+            public void onChildAdded(DataSnapshot chatSnapshot, String previousChildName) {
+                String userId = chatSnapshot.getKey();
+                if (userId != null && !userId.equals(currentUserId)) {
+                    DatabaseReference messagesRef = chatSnapshot.getRef()
+                            .child(Constants.MESSAGES_REF);
+                    listenToMessages(messagesRef, userId);
+                }
             }
+
+            @Override
+            public void onChildChanged(DataSnapshot snapshot, String previousChildName) {}
+            @Override
+            public void onChildRemoved(DataSnapshot snapshot) {
+                if (snapshot.getKey() != null) {
+                    DatabaseReference messagesRef = snapshot.getRef()
+                            .child(Constants.MESSAGES_REF);
+                    messagesRef.removeEventListener(messagesListener);
+                }
+            }
+            @Override
+            public void onChildMoved(DataSnapshot snapshot, String previousChildName) {}
+            @Override
+            public void onCancelled(DatabaseError error) {}
         });
     }
 
@@ -121,7 +115,7 @@ public class MessageNotificationService extends Service {
             public void onChildAdded(DataSnapshot snapshot, String previousChildName) {
                 Message message = snapshot.getValue(Message.class);
                 if (message != null && !message.getSenderId().equals(currentUserId)) {
-                    showNotification(message, currentUserId);
+                    showNotification(message);
                 }
             }
 
@@ -143,7 +137,7 @@ public class MessageNotificationService extends Service {
             public void onChildAdded(DataSnapshot snapshot, String previousChildName) {
                 Message message = snapshot.getValue(Message.class);
                 if (message != null && !message.getSenderId().equals(currentUserId)) {
-                    showNotification(message, userId);
+                    showNotification(message);
                 }
             }
 
@@ -159,7 +153,38 @@ public class MessageNotificationService extends Service {
         messagesRef.addChildEventListener(chatMessagesListener);
     }
 
-    // ... (other existing methods remain the same)
+    private void showNotification(Message message) {
+        // Check if app is in foreground and if we're in the active chat
+        if (isAppInForeground && activeChatId != null && activeChatId.equals(message.getSenderId())) {
+            return; // Don't show notification if we're in the chat with this sender
+        }
+
+        AuthHelper.isAdmin().addOnCompleteListener(task -> {
+            if (task.isSuccessful()) {
+                boolean isUserAdmin = task.getResult();
+                String title;
+                if (!isUserAdmin) {
+                    title = ADMIN_DISPLAY_NAME;
+                } else {
+                    title = message.getSenderName();
+                }
+
+                NotificationHelper.showMessageNotification(
+                    this,
+                    title,
+                    message.getText(),
+                    message.getSenderId(),
+                    message.getSenderName()
+                );
+            }
+        });
+    }
+
+    @Nullable
+    @Override
+    public IBinder onBind(Intent intent) {
+        return null;
+    }
 
     @Override
     public void onDestroy() {
@@ -167,33 +192,44 @@ public class MessageNotificationService extends Service {
         if (messagesListener != null && databaseRef != null) {
             databaseRef.removeEventListener(messagesListener);
         }
-        AppStateTracker.reset();
+        activeChatId = null;
+        isAppInForeground = false;
         AuthHelper.clearCache();
     }
 }
 
 
-
-
-
-
-
+In your base activity or main activity:
 
 @Override
 protected void onResume() {
     super.onResume();
-    AppStateTracker.setInChat(true, userId); // userId is the chat partner's ID
-    AppStateTracker.setAppInForeground(true);
+    MessageNotificationService.setAppInForeground(true);
 }
 
 @Override
 protected void onPause() {
     super.onPause();
-    AppStateTracker.setInChat(false, null);
+    MessageNotificationService.setAppInForeground(false);
 }
 
 
 
+In your ChatActivity:
+
+
+@Override
+protected void onResume() {
+    super.onResume();
+    String chatPartnerId = getIntent().getStringExtra(Constants.EXTRA_USER_ID);
+    MessageNotificationService.setActiveChatId(chatPartnerId);
+}
+
+@Override
+protected void onPause() {
+    super.onPause();
+    MessageNotificationService.setActiveChatId(null);
+}
 
 
 
